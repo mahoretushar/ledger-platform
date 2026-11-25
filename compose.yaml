@@ -1,0 +1,77 @@
+# Full platform: docker compose up -d --build --wait && ./scripts/smoke-test.sh
+x-service-env: &service-env
+  KAFKA_BOOTSTRAP: kafka:9092
+  JWT_SECRET: ${JWT_SECRET:-change-me-this-is-a-local-dev-secret-of-32+bytes}
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - ./docker/init-databases.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      retries: 20
+
+  kafka:
+    image: apache/kafka:4.1.0
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server kafka:9092 > /dev/null 2>&1"]
+      interval: 5s
+      retries: 30
+
+  ledger-service:
+    build: { context: ., args: { MODULE: ledger-service } }
+    environment:
+      <<: *service-env
+      DB_URL: jdbc:postgresql://postgres:5432/ledger
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- localhost:8081/actuator/health/readiness | grep -q UP"]
+      interval: 5s
+      retries: 30
+
+  notification-service:
+    build: { context: ., args: { MODULE: notification-service } }
+    environment:
+      <<: *service-env
+      DB_URL: jdbc:postgresql://postgres:5432/notification
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- localhost:8082/actuator/health/readiness | grep -q UP"]
+      interval: 5s
+      retries: 30
+
+  api-gateway:
+    build: { context: ., args: { MODULE: api-gateway } }
+    environment:
+      LEDGER_URI: http://ledger-service:8081
+      NOTIFICATION_URI: http://notification-service:8082
+    ports:
+      - "8080:8080"
+    depends_on:
+      ledger-service: { condition: service_healthy }
+      notification-service: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- localhost:8080/actuator/health | grep -q UP"]
+      interval: 5s
+      retries: 30
